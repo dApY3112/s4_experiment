@@ -1,0 +1,337 @@
+name: S4 artifact identity pilot
+
+on:
+  push:
+    branches:
+      - s4-artifact-identity-pilot-001
+    paths:
+      - .s4-pilot/trigger.txt
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: s4-artifact-identity-pilot-001
+  cancel-in-progress: false
+
+env:
+  SUBJECT_ARTIFACT: s4-pilot-subject
+  CHECKSUM_ARTIFACT: s4-pilot-checksum
+
+jobs:
+  producer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+      variant: ${{ steps.fixture.outputs.variant }}
+      subject_id: ${{ steps.subject_upload.outputs.artifact-id }}
+      subject_digest: ${{ steps.subject_upload.outputs.artifact-digest }}
+      subject_sha256: ${{ steps.fixture.outputs.subject_sha256 }}
+      checksum_id: ${{ steps.checksum_upload.outputs.artifact-id }}
+      checksum_digest: ${{ steps.checksum_upload.outputs.artifact-digest }}
+      checksum_sha256: ${{ steps.fixture.outputs.checksum_sha256 }}
+    steps:
+      - name: Resolve locked mode
+        id: mode
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$COMMIT_MESSAGE" in
+            "s4-pilot mode: clean") mode="clean" ;;
+            "s4-pilot mode: checksum-delete") mode="checksum-delete" ;;
+            "s4-pilot mode: subject-delete") mode="subject-delete" ;;
+            *) echo "Unexpected pilot commit message" >&2; exit 64 ;;
+          esac
+          printf 'mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
+
+      - name: Create distinct A or B fixture
+        id: fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$GITHUB_RUN_ATTEMPT" in
+            1) variant="A" ;;
+            2) variant="B" ;;
+            *) echo "Only attempts 1 and 2 are permitted" >&2; exit 65 ;;
+          esac
+          mkdir -p fixture/subject fixture/checksum receipt
+          printf 's4-artifact-identity-pilot-v1\nvariant=%s\n' "$variant" > fixture/subject/subject.txt
+          subject_sha256="$(sha256sum fixture/subject/subject.txt | cut -d' ' -f1)"
+          printf '%s  subject.txt\n' "$subject_sha256" > fixture/checksum/subject.sha256
+          checksum_sha256="$(sha256sum fixture/checksum/subject.sha256 | cut -d' ' -f1)"
+          printf 'variant=%s\n' "$variant" >> "$GITHUB_OUTPUT"
+          printf 'subject_sha256=%s\n' "$subject_sha256" >> "$GITHUB_OUTPUT"
+          printf 'checksum_sha256=%s\n' "$checksum_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload subject under stable name
+        id: subject_upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: s4-pilot-subject
+          path: fixture/subject/subject.txt
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+
+      - name: Upload checksum under stable name
+        id: checksum_upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: s4-pilot-checksum
+          path: fixture/checksum/subject.sha256
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+
+      - name: Write producer upload receipt
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+          VARIANT: ${{ steps.fixture.outputs.variant }}
+          SUBJECT_ID: ${{ steps.subject_upload.outputs.artifact-id }}
+          SUBJECT_DIGEST: ${{ steps.subject_upload.outputs.artifact-digest }}
+          SUBJECT_SHA256: ${{ steps.fixture.outputs.subject_sha256 }}
+          CHECKSUM_ID: ${{ steps.checksum_upload.outputs.artifact-id }}
+          CHECKSUM_DIGEST: ${{ steps.checksum_upload.outputs.artifact-digest }}
+          CHECKSUM_SHA256: ${{ steps.fixture.outputs.checksum_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg commit "$GITHUB_SHA" \
+            --arg ref "$GITHUB_REF" \
+            --arg mode "$MODE" \
+            --arg variant "$VARIANT" \
+            --arg subject_name "$SUBJECT_ARTIFACT" \
+            --arg subject_id "$SUBJECT_ID" \
+            --arg subject_digest "$SUBJECT_DIGEST" \
+            --arg subject_sha256 "$SUBJECT_SHA256" \
+            --arg checksum_name "$CHECKSUM_ARTIFACT" \
+            --arg checksum_id "$CHECKSUM_ID" \
+            --arg checksum_digest "$CHECKSUM_DIGEST" \
+            --arg checksum_sha256 "$CHECKSUM_SHA256" \
+            '{schema_version:1,repository:$repository,run_id:($run_id|tonumber),attempt:($attempt|tonumber),commit:$commit,ref:$ref,mode:$mode,variant:$variant,subject:{name:$subject_name,id:($subject_id|tonumber),archive_digest:$subject_digest,inner_sha256:$subject_sha256},checksum:{name:$checksum_name,id:($checksum_id|tonumber),archive_digest:$checksum_digest,inner_sha256:$checksum_sha256}}' \
+            > receipt/producer.json
+
+      - name: Upload unique producer receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: s4-pilot-producer-${{ steps.mode.outputs.mode }}-attempt-${{ github.run_attempt }}
+          path: receipt/producer.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+
+  verify:
+    name: attest-sim
+    needs: producer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download subject by name in current run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: s4-pilot-subject
+          path: verify/subject
+
+      - name: Hash selected subject
+        id: subject_hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          value="$(sha256sum verify/subject/subject.txt | cut -d' ' -f1)"
+          printf 'value=%s\n' "$value" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for checksum B deletion barrier
+        id: checksum_barrier
+        if: ${{ needs.producer.outputs.mode == 'checksum-delete' && github.run_attempt == 2 }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_ID: ${{ needs.producer.outputs.checksum_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p verify/receipt
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100"
+          deadline=$((SECONDS + 600))
+          while (( SECONDS < deadline )); do
+            curl --fail --silent --show-error \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$api" > verify/receipt/checksum-barrier-listing.json
+            current_count="$(jq --argjson id "$TARGET_ID" '[.artifacts[] | select(.id == $id and (.expired|not))] | length' verify/receipt/checksum-barrier-listing.json)"
+            older_count="$(jq --arg name "$CHECKSUM_ARTIFACT" --argjson id "$TARGET_ID" '[.artifacts[] | select(.name == $name and .id != $id and (.expired|not))] | length' verify/receipt/checksum-barrier-listing.json)"
+            if [[ "$current_count" == "0" && "$older_count" -ge 1 ]]; then
+              jq -n --arg target_id "$TARGET_ID" --argjson older_count "$older_count" --arg observed_at "$(date -u +%FT%TZ)" '{kind:"checksum-delete",target_id:($target_id|tonumber),target_absent:true,older_same_name_present:($older_count>0),observed_at_utc:$observed_at}' > verify/receipt/checksum-barrier.json
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "Timed out waiting for controller deletion" >&2
+          exit 70
+
+      - name: Download checksum by name in current run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: s4-pilot-checksum
+          path: verify/checksum
+
+      - name: Verify selected subject against selected checksum
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p verify/receipt
+          actual="$(sha256sum verify/subject/subject.txt | cut -d' ' -f1)"
+          expected="$(cut -d' ' -f1 verify/checksum/subject.sha256)"
+          checksum_file_sha256="$(sha256sum verify/checksum/subject.sha256 | cut -d' ' -f1)"
+          jq -n --arg actual "$actual" --arg expected "$expected" --arg checksum_file_sha256 "$checksum_file_sha256" --arg checked_at "$(date -u +%FT%TZ)" '{actual_subject_sha256:$actual,expected_subject_sha256:$expected,checksum_file_sha256:$checksum_file_sha256,equal:($actual==$expected),checked_at_utc:$checked_at}' > verify/receipt/check.json
+          printf 'expected=%s\n' "$expected" >> "$GITHUB_OUTPUT"
+          printf 'checksum_file_sha256=%s\n' "$checksum_file_sha256" >> "$GITHUB_OUTPUT"
+          (cd verify/subject && sha256sum --check --strict ../checksum/subject.sha256)
+
+      - name: Write attest-sim receipt
+        if: ${{ always() }}
+        env:
+          MODE: ${{ needs.producer.outputs.mode }}
+          PRODUCER_VARIANT: ${{ needs.producer.outputs.variant }}
+          PRODUCER_SUBJECT_ID: ${{ needs.producer.outputs.subject_id }}
+          PRODUCER_SUBJECT_SHA256: ${{ needs.producer.outputs.subject_sha256 }}
+          SELECTED_SUBJECT_SHA256: ${{ steps.subject_hash.outputs.value }}
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p verify/receipt
+          expected=""
+          checksum_file_sha256=""
+          if [[ -f verify/receipt/check.json ]]; then
+            expected="$(jq -r '.expected_subject_sha256' verify/receipt/check.json)"
+            checksum_file_sha256="$(jq -r '.checksum_file_sha256' verify/receipt/check.json)"
+          fi
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg commit "$GITHUB_SHA" \
+            --arg ref "$GITHUB_REF" \
+            --arg mode "$MODE" \
+            --arg producer_variant "$PRODUCER_VARIANT" \
+            --arg producer_subject_id "$PRODUCER_SUBJECT_ID" \
+            --arg producer_subject_sha256 "$PRODUCER_SUBJECT_SHA256" \
+            --arg selected_subject_sha256 "$SELECTED_SUBJECT_SHA256" \
+            --arg selected_checksum_inner_sha256 "$checksum_file_sha256" \
+            --arg checksum_expected_subject_sha256 "$expected" \
+            --arg check_outcome "$CHECK_OUTCOME" \
+            '{schema_version:1,fixture_role:"attest-sim",repository:$repository,run_id:($run_id|tonumber),attempt:($attempt|tonumber),commit:$commit,ref:$ref,mode:$mode,producer_variant:$producer_variant,producer_subject_id:($producer_subject_id|tonumber),producer_subject_sha256:$producer_subject_sha256,selected_subject_sha256:$selected_subject_sha256,selected_checksum_inner_sha256:$selected_checksum_inner_sha256,checksum_expected_subject_sha256:$checksum_expected_subject_sha256,check_outcome:$check_outcome,verified_current_subject:($check_outcome=="success" and $selected_subject_sha256==$producer_subject_sha256)}' \
+            > verify/receipt/verify.json
+
+      - name: Upload unique attest-sim receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: s4-pilot-verify-${{ needs.producer.outputs.mode }}-attempt-${{ github.run_attempt }}
+          path: verify/receipt
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+
+  sink:
+    name: safe-sink
+    needs:
+      - producer
+      - verify
+    if: ${{ needs.verify.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Wait for subject B deletion barrier
+        id: subject_barrier
+        if: ${{ needs.producer.outputs.mode == 'subject-delete' && github.run_attempt == 2 }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_ID: ${{ needs.producer.outputs.subject_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p sink/receipt
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100"
+          deadline=$((SECONDS + 600))
+          while (( SECONDS < deadline )); do
+            curl --fail --silent --show-error \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$api" > sink/receipt/subject-barrier-listing.json
+            current_count="$(jq --argjson id "$TARGET_ID" '[.artifacts[] | select(.id == $id and (.expired|not))] | length' sink/receipt/subject-barrier-listing.json)"
+            older_count="$(jq --arg name "$SUBJECT_ARTIFACT" --argjson id "$TARGET_ID" '[.artifacts[] | select(.name == $name and .id != $id and (.expired|not))] | length' sink/receipt/subject-barrier-listing.json)"
+            if [[ "$current_count" == "0" && "$older_count" -ge 1 ]]; then
+              jq -n --arg target_id "$TARGET_ID" --argjson older_count "$older_count" --arg observed_at "$(date -u +%FT%TZ)" '{kind:"subject-delete",target_id:($target_id|tonumber),target_absent:true,older_same_name_present:($older_count>0),observed_at_utc:$observed_at}' > sink/receipt/subject-barrier.json
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "Timed out waiting for controller deletion" >&2
+          exit 71
+
+      - name: Download publication subject by name in current run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: s4-pilot-subject
+          path: sink/subject
+
+      - name: Evaluate safe sink selection
+        id: evaluate
+        env:
+          MODE: ${{ needs.producer.outputs.mode }}
+          PRODUCER_VARIANT: ${{ needs.producer.outputs.variant }}
+          PRODUCER_SUBJECT_ID: ${{ needs.producer.outputs.subject_id }}
+          PRODUCER_SUBJECT_SHA256: ${{ needs.producer.outputs.subject_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p sink/receipt
+          actual="$(sha256sum sink/subject/subject.txt | cut -d' ' -f1)"
+          if [[ "$actual" == "$PRODUCER_SUBJECT_SHA256" ]]; then relation="current-attempt"; else relation="different-bytes"; fi
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg commit "$GITHUB_SHA" \
+            --arg ref "$GITHUB_REF" \
+            --arg mode "$MODE" \
+            --arg producer_variant "$PRODUCER_VARIANT" \
+            --arg producer_subject_id "$PRODUCER_SUBJECT_ID" \
+            --arg producer_subject_sha256 "$PRODUCER_SUBJECT_SHA256" \
+            --arg selected_subject_sha256 "$actual" \
+            --arg relation "$relation" \
+            --arg observed_at "$(date -u +%FT%TZ)" \
+            '{schema_version:1,fixture_role:"safe-sink",repository:$repository,run_id:($run_id|tonumber),attempt:($attempt|tonumber),commit:$commit,ref:$ref,mode:$mode,producer_variant:$producer_variant,producer_subject_id:($producer_subject_id|tonumber),producer_subject_sha256:$producer_subject_sha256,selected_subject_sha256:$selected_subject_sha256,relation_to_current_producer:$relation,observed_at_utc:$observed_at}' \
+            > sink/receipt/sink.json
+          printf 'selected_subject_sha256=%s\n' "$actual" >> "$GITHUB_OUTPUT"
+          printf 'relation=%s\n' "$relation" >> "$GITHUB_OUTPUT"
+          if [[ "$MODE" != "subject-delete" || "$GITHUB_RUN_ATTEMPT" != "2" ]]; then
+            test "$relation" = "current-attempt"
+          fi
+
+      - name: Upload unique safe-sink receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: s4-pilot-sink-${{ needs.producer.outputs.mode }}-attempt-${{ github.run_attempt }}
+          path: sink/receipt
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
